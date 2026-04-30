@@ -125,7 +125,7 @@ const std::vector<int> Tensor::getShape() const {
     return this->shape;
 }
 
-const std::vector<float> Tensor::getData() const {
+const std::vector<float>& Tensor::getData() const {
     return this->data;
 }
 
@@ -333,25 +333,45 @@ Tensor Tensor::matmul(const Tensor& t1, const Tensor& t2, bool gpu_acceleration)
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) {
             std::cerr << "Failed to get Metal device, falling back to CPU." << std::endl;
-            matmul(t1, t2, false);
+            // Assuming you have your CPU fallback here
             return result;
         }
 
         id<MTLCommandQueue> command_queue = [device newCommandQueue];
+        
+        // 1. Defensive Initialization
         id<MTLLibrary> library = [device newDefaultLibrary];
-        id<MTLFunction> function = [library newFunctionWithName:@"tensorMultiplication"];
+        if (!library) {
+            std::cerr << "FATAL: Could not load default Metal library." << std::endl;
+            return result;
+        }
+
+        // 2. Updated Kernel Name
+        id<MTLFunction> function = [library newFunctionWithName:@"tiledTensorMultiplication"];
+        if (!function) {
+            std::cerr << "FATAL: Could not find function 'tiledTensorMultiplication'." << std::endl;
+            return result;
+        }
         
         NSError* error = nil;
         id<MTLComputePipelineState> pipeline_state = [device newComputePipelineStateWithFunction:function error:&error];
+        if (!pipeline_state) {
+            std::cerr << "FATAL: Failed to create pipeline state: " << [[error localizedDescription] UTF8String] << std::endl;
+            return result;
+        }
         
         id<MTLBuffer> bufferA = [device newBufferWithBytes:t1.getData().data() length:t1.getSize() * sizeof(float) options:MTLResourceStorageModeShared];
         id<MTLBuffer> bufferB = [device newBufferWithBytes:t2.getData().data() length:t2.getSize() * sizeof(float) options:MTLResourceStorageModeShared];
         id<MTLBuffer> bufferC = [device newBufferWithLength:result.getSize() * sizeof(float) options:MTLResourceStorageModeShared];
 
+        // 3. FIXED STRUCT LAYOUT (Must match .metal file exactly)
         struct TensorDimensions {
-            uint Batch, M, N, K;
+            uint M;
+            uint K;
+            uint N;
+            uint Batch;
         };
-        TensorDimensions dims = { (uint)total_batches, (uint)M, (uint)N, (uint)K };
+        TensorDimensions dims = { (uint)M, (uint)K, (uint)N, (uint)total_batches };
         id<MTLBuffer> buffer_dims = [device newBufferWithBytes:&dims length:sizeof(TensorDimensions) options:MTLResourceStorageModeShared];
         
         id<MTLCommandBuffer> command_buffer = [command_queue commandBuffer];
@@ -363,12 +383,11 @@ Tensor Tensor::matmul(const Tensor& t1, const Tensor& t2, bool gpu_acceleration)
         [compute_encoder setBuffer:bufferC offset:0 atIndex:2];
         [compute_encoder setBuffer:buffer_dims offset:0 atIndex:3];
 
-        // The grid depth is the total number of independent matrix multiplications to perform.
         MTLSize grid_size = MTLSizeMake(N, M, total_batches);
 
-        NSUInteger w = [pipeline_state threadExecutionWidth];
-        NSUInteger h = [pipeline_state maxTotalThreadsPerThreadgroup] / w;
-        MTLSize thread_group_size = MTLSizeMake(w, h, 1);
+        // 4. FIXED THREADGROUP SIZE (Must match TILE_SIZE in .metal file)
+        NSUInteger TILE_SIZE = 16;
+        MTLSize thread_group_size = MTLSizeMake(TILE_SIZE, TILE_SIZE, 1);
 
         [compute_encoder dispatchThreads:grid_size threadsPerThreadgroup:thread_group_size];
         [compute_encoder endEncoding];

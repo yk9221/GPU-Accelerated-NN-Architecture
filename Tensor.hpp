@@ -49,7 +49,7 @@ public:
     int getRank() const;
     int getSize() const;
     const std::vector<int> getShape() const;
-    const std::vector<float> getData() const;
+    const std::vector<float>& getData() const;
     float* getDataPtr();
     
     // --- Operations ---
